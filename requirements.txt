@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+manim
+edge-tts
+pydantic
