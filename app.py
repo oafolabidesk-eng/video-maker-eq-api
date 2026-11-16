@@ -1,10 +1,21 @@
 import os
 import subprocess
 import uuid
+import zipfile
+from typing import List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 app = FastAPI()
+
+class WeeklyBatchRequest(BaseModel):
+    long_script: str
+    short_scripts: List[str] = Field(..., min_length=1, max_length=7)
+    long_x_pct: float = 0.50
+    long_y_pct: float = 0.88
+    short_x_pct: float = 0.45
+    short_y_pct: float = 0.82
 
 def cleanup_files(*paths: str):
     for path in paths:
@@ -12,7 +23,6 @@ def cleanup_files(*paths: str):
             os.remove(path)
 
 def get_audio_duration(audio_path: str) -> float:
-    """Measure exact MP3 duration using ffprobe so Manim matches the voiceover."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error",
@@ -26,20 +36,12 @@ def get_audio_duration(audio_path: str) -> float:
     )
     return max(3.5, float(result.stdout.strip()))
 
-@app.get("/make-video")
-def make_video(
-    background_tasks: BackgroundTasks,
-    text: str,
-    video_type: str = "short",  # "long" (16:9 widescreen) or "short" (9:16 vertical)
-    x_pct: float = 0.45,        # Default horizontal text position (0.0 to 1.0)
-    y_pct: float = 0.82         # Default vertical text position (0.0 to 1.0)
-):
+def render_single_video(text: str, video_type: str, x_pct: float, y_pct: float, output_filename: str):
+    """Helper function that generates TTS audio, renders Manim, and merges them."""
     job_id = str(uuid.uuid4())
     manim_output = f"{job_id}_raw.mp4"
     audio_file = f"{job_id}.mp3"
-    final_output = f"{job_id}_final.mp4"
 
-    # Match resolution and Manim's output folder name for Shorts (9:16) vs Long-form (16:9)
     if video_type == "short":
         resolution = ["-r", "480,854"]
         folder_name = "854p15"
@@ -50,16 +52,9 @@ def make_video(
     rendered_path = os.path.join("media", "videos", "mixing_scene", folder_name, manim_output)
 
     try:
-        # 1. Generate voiceover audio
-        subprocess.run(
-            ["edge-tts", "--text", text, "--write-media", audio_file],
-            check=True
-        )
-
-        # 2. Get audio length so Manim animation matches the full narration
+        subprocess.run(["edge-tts", "--text", text, "--write-media", audio_file], check=True)
         audio_duration = get_audio_duration(audio_file)
 
-        # 3. Pass all parameters safely to Manim
         env = os.environ.copy()
         env["SCENE_TEXT"] = text
         env["VIDEO_TYPE"] = video_type
@@ -67,14 +62,12 @@ def make_video(
         env["TEXT_Y_PCT"] = str(y_pct)
         env["AUDIO_DURATION"] = str(audio_duration)
 
-        # 4. Render Manim scene
         subprocess.run(
             ["manim", "-ql", *resolution, "mixing_scene.py", "MixingGraph", "-o", manim_output],
             env=env,
             check=True
         )
 
-        # 5. Merge video and audio
         subprocess.run(
             [
                 "ffmpeg", "-y",
@@ -83,21 +76,75 @@ def make_video(
                 "-c:v", "copy",
                 "-c:a", "aac",
                 "-shortest",
-                final_output
+                output_filename
             ],
             check=True
         )
-
-        # Clean up intermediate files immediately; delete final video after transfer
+    finally:
         cleanup_files(audio_file, rendered_path)
+
+@app.get("/make-video")
+def make_video(
+    background_tasks: BackgroundTasks,
+    text: str,
+    video_type: str = "short",
+    x_pct: float = 0.45,
+    y_pct: float = 0.82
+):
+    final_output = f"{uuid.uuid4()}_final.mp4"
+    try:
+        render_single_video(text, video_type, x_pct, y_pct, final_output)
         background_tasks.add_task(cleanup_files, final_output)
+        return FileResponse(final_output, media_type="video/mp4", filename=f"{video_type}_video.mp4")
+    except subprocess.CalledProcessError as e:
+        cleanup_files(final_output)
+        raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
+
+@app.post("/make-weekly-batch")
+def make_weekly_batch(payload: WeeklyBatchRequest, background_tasks: BackgroundTasks):
+    batch_id = str(uuid.uuid4())[:8]
+    zip_filename = f"weekly_videos_{batch_id}.zip"
+    generated_videos = []
+
+    try:
+        # 1. Render the main 16:9 long-form video
+        long_file = f"{batch_id}_00_long_form.mp4"
+        render_single_video(
+            text=payload.long_script,
+            video_type="long",
+            x_pct=payload.long_x_pct,
+            y_pct=payload.long_y_pct,
+            output_filename=long_file
+        )
+        generated_videos.append((long_file, "00_long_form.mp4"))
+
+        # 2. Render up to 7 vertical 9:16 Shorts
+        for idx, short_text in enumerate(payload.short_scripts, start=1):
+            short_file = f"{batch_id}_0{idx}_short_day{idx}.mp4"
+            render_single_video(
+                text=short_text,
+                video_type="short",
+                x_pct=payload.short_x_pct,
+                y_pct=payload.short_y_pct,
+                output_filename=short_file
+            )
+            generated_videos.append((short_file, f"0{idx}_short_day{idx}.mp4"))
+
+        # 3. Bundle all 8 videos into a single ZIP archive
+        with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for disk_path, archive_name in generated_videos:
+                zipf.write(disk_path, arcname=archive_name)
+
+        # Clean up individual MP4s immediately; remove ZIP after download completes
+        cleanup_files(*(path for path, _ in generated_videos))
+        background_tasks.add_task(cleanup_files, zip_filename)
 
         return FileResponse(
-            final_output,
-            media_type="video/mp4",
-            filename=f"{video_type}_{job_id[:8]}.mp4"
+            zip_filename,
+            media_type="application/zip",
+            filename="weekly_youtube_batch.zip"
         )
 
     except subprocess.CalledProcessError as e:
-        cleanup_files(audio_file, rendered_path, final_output)
-        raise HTTPException(status_code=500, detail=f"Video generation failed: {e}")
+        cleanup_files(*(path for path, _ in generated_videos), zip_filename)
+        raise HTTPException(status_code=500, detail=f"Batch video generation failed: {e}")
