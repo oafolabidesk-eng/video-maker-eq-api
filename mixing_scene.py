@@ -4,12 +4,14 @@ import textwrap
 
 class MixingGraph(Scene):
     def construct(self):
-        # 1. Read inputs from FastAPI
+        # 1. Read inputs from FastAPI / n8n environment variables
         text = os.getenv("SCENE_TEXT", "Mixing technique")
         video_type = os.getenv("VIDEO_TYPE", "short")
         x_pct = float(os.getenv("TEXT_X_PCT", "0.45"))
         y_pct = float(os.getenv("TEXT_Y_PCT", "0.82"))
         total_duration = float(os.getenv("AUDIO_DURATION", "4.5"))
+        target_power = float(os.getenv("CURVE_POWER", "2.0"))
+        target_gain = float(os.getenv("CURVE_GAIN", "0.8"))
 
         # 2. Set clean white screen background
         self.camera.background_color = WHITE
@@ -33,16 +35,19 @@ class MixingGraph(Scene):
         curve_power = ValueTracker(1)
         curve_gain = ValueTracker(1)
 
+        # Bounded axes (x: 0 to 5, y: 0 to 25)
         ax = Axes(
-            x_range=[0, 5],
-            y_range=[0, 25],
+            x_range=[0, 5, 1],
+            y_range=[0, 25, 5],
             x_length=x_len,
             y_length=y_len,
             axis_config={"color": BLACK}
         ).shift(graph_shift)
 
+        # Clamp y at 25 so extreme AI Agent curve_power/curve_gain values stay inside the axes
         def get_y(x):
-            return curve_gain.get_value() * (x ** curve_power.get_value())
+            val = curve_gain.get_value() * (x ** curve_power.get_value())
+            return min(val, 25.0)
 
         graph = always_redraw(
             lambda: ax.plot(get_y, x_range=[0, 5], color=BLUE_D, stroke_width=4)
@@ -98,8 +103,8 @@ class MixingGraph(Scene):
         self.add(ax, graph, cursor, text_overlay)
         self.play(cursor_x.animate.set_value(3), run_time=part1_time)
         self.play(
-            curve_power.animate.set_value(2),
-            curve_gain.animate.set_value(0.8),
+            curve_power.animate.set_value(target_power),
+            curve_gain.animate.set_value(target_gain),
             cursor_x.animate.set_value(5),
             run_time=part2_time
         )
