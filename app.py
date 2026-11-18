@@ -1,17 +1,205 @@
 import glob
 import os
+import re
+import sqlite3
 import subprocess
+import threading
+import time
 import uuid
 import zipfile
+from contextlib import asynccontextmanager, closing
 from typing import List, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Multi-Plugin Vocal Chain & Weekly YouTube Generator API")
+# ---------------------------------------------------------------------------
+# Persistent job store (SQLite, shared safely across workers on one host)
+# ---------------------------------------------------------------------------
 
-JOBS: Dict[str, dict] = {}
+JOBS_DB = os.environ.get("JOBS_DB", "jobs.db")
+JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_HOURS", "24")) * 3600
+HEARTBEAT_INTERVAL = 10      # seconds between heartbeats from a live process
+STALE_AFTER = 45             # "processing" job with no heartbeat this long = dead
+MAINTENANCE_INTERVAL = 600   # seconds between expiry / orphan sweeps
+INSTANCE_ID = uuid.uuid4().hex  # unique per running process
+
+_OUTPUT_FILE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.mp4|\.zip|_.+\.mp4)$"
+)
+_TEMP_FILE_RE = re.compile(r"^(temp_[0-9a-f]{32}.*|concat_[0-9a-f]{32}\.txt)$")
+
+
+class JobStore:
+    """Durable job tracker. Survives restarts and is visible to all workers."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with closing(self._conn()) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    job_id     TEXT PRIMARY KEY,
+                    type       TEXT NOT NULL,
+                    status     TEXT NOT NULL,
+                    file       TEXT,
+                    error      TEXT,
+                    owner      TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def create(self, job_id: str, job_type: str) -> None:
+        now = time.time()
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "INSERT INTO jobs (job_id, type, status, owner, created_at, updated_at) "
+                "VALUES (?, ?, 'processing', ?, ?, ?)",
+                (job_id, job_type, INSTANCE_ID, now, now),
+            )
+
+    def update(self, job_id: str, **fields) -> None:
+        allowed = {"status", "file", "error"}
+        fields = {k: v for k, v in fields.items() if k in allowed}
+        if not fields:
+            return
+        assignments = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                f"UPDATE jobs SET {assignments} WHERE job_id = ?",
+                (*fields.values(), time.time(), job_id),
+            )
+
+    def get(self, job_id: str) -> Optional[dict]:
+        self.fail_stale()
+        with closing(self._conn()) as conn:
+            row = conn.execute(
+                "SELECT job_id, type, status, file, error, created_at, updated_at "
+                "FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def claim_for_download(self, job_id: str) -> bool:
+        """Atomically delete a finished job; only one caller can win."""
+        with closing(self._conn()) as conn, conn:
+            cur = conn.execute(
+                "DELETE FROM jobs WHERE job_id = ? AND status = 'completed'",
+                (job_id,),
+            )
+            return cur.rowcount == 1
+
+    def heartbeat(self) -> None:
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "UPDATE jobs SET updated_at = ? WHERE owner = ? AND status = 'processing'",
+                (time.time(), INSTANCE_ID),
+            )
+
+    def fail_stale(self) -> int:
+        """Mark 'processing' jobs whose worker stopped heartbeating as failed."""
+        cutoff = time.time() - STALE_AFTER
+        with closing(self._conn()) as conn, conn:
+            cur = conn.execute(
+                "UPDATE jobs SET status = 'failed', "
+                "error = 'Job interrupted (server restarted or worker died). Please resubmit.', "
+                "updated_at = ? WHERE status = 'processing' AND updated_at < ?",
+                (time.time(), cutoff),
+            )
+            return cur.rowcount
+
+    def purge_expired(self) -> List[str]:
+        """Delete finished/failed jobs older than the TTL; return their output files."""
+        cutoff = time.time() - JOB_TTL_SECONDS
+        with closing(self._conn()) as conn, conn:
+            rows = conn.execute(
+                "SELECT job_id, file FROM jobs "
+                "WHERE status IN ('completed', 'failed') AND updated_at < ?",
+                (cutoff,),
+            ).fetchall()
+            conn.executemany(
+                "DELETE FROM jobs WHERE job_id = ?", [(r["job_id"],) for r in rows]
+            )
+        return [r["file"] for r in rows if r["file"]]
+
+
+def sweep_orphan_files() -> None:
+    """Remove stale outputs and temp files left behind by crashes or restarts."""
+    now = time.time()
+    try:
+        names = os.listdir(".")
+    except OSError:
+        return
+    for name in names:
+        is_output = bool(_OUTPUT_FILE_RE.match(name))
+        is_temp = bool(_TEMP_FILE_RE.match(name))
+        if not (is_output or is_temp):
+            continue
+        max_age = JOB_TTL_SECONDS if is_output else 3600
+        try:
+            if os.path.isfile(name) and now - os.path.getmtime(name) > max_age:
+                os.remove(name)
+        except OSError:
+            pass
+
+
+def run_maintenance(store: "JobStore") -> None:
+    store.fail_stale()
+    for path in store.purge_expired():
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+    sweep_orphan_files()
+
+
+def _background_loop(store: "JobStore", stop: threading.Event) -> None:
+    last_maintenance = 0.0
+    while not stop.wait(HEARTBEAT_INTERVAL):
+        try:
+            store.heartbeat()
+            if time.time() - last_maintenance > MAINTENANCE_INTERVAL:
+                run_maintenance(store)
+                last_maintenance = time.time()
+        except Exception:
+            pass  # never let the housekeeping thread die
+
+
+JOBS = JobStore(JOBS_DB)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    run_maintenance(JOBS)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_background_loop, args=(JOBS, stop), daemon=True
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
+app = FastAPI(
+    title="Multi-Plugin Vocal Chain & Weekly YouTube Generator API",
+    lifespan=lifespan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -257,10 +445,10 @@ def process_single_job(job_id: str, req: SingleVideoRequest) -> None:
             x_labels=req.x_labels,
             y_labels=req.y_labels,
         )
-        JOBS[job_id].update({"status": "completed", "file": output_path})
+        JOBS.update(job_id, status="completed", file=output_path)
     except Exception as e:
         cleanup_files(output_path)
-        JOBS[job_id].update({"status": "failed", "error": str(e)})
+        JOBS.update(job_id, status="failed", error=str(e))
 
 
 def process_batch_job(job_id: str, req: WeeklyChainBatchRequest) -> None:
@@ -319,10 +507,10 @@ def process_batch_job(job_id: str, req: WeeklyChainBatchRequest) -> None:
             for i, p in enumerate(short_paths, start=1):
                 zf.write(p, arcname=f"{i:02d}_short_day{i}.mp4")
 
-        JOBS[job_id].update({"status": "completed", "file": zip_path})
+        JOBS.update(job_id, status="completed", file=zip_path)
     except Exception as e:
         cleanup_files(zip_path)
-        JOBS[job_id].update({"status": "failed", "error": str(e)})
+        JOBS.update(job_id, status="failed", error=str(e))
     finally:
         cleanup_files(merged_disk_path, *long_paths, *short_paths)
 
@@ -368,7 +556,7 @@ def list_voices():
 @app.post("/jobs/single")
 def create_single_job(req: SingleVideoRequest, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "processing", "type": "single"}
+    JOBS.create(job_id, "single")
     background_tasks.add_task(process_single_job, job_id, req)
     return {"job_id": job_id, "status": "processing"}
 
@@ -378,7 +566,7 @@ def create_weekly_batch_job(
     req: WeeklyChainBatchRequest, background_tasks: BackgroundTasks
 ):
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {"status": "processing", "type": "weekly-batch"}
+    JOBS.create(job_id, "weekly-batch")
     background_tasks.add_task(process_batch_job, job_id, req)
     return {"job_id": job_id, "status": "processing"}
 
@@ -388,7 +576,7 @@ def job_status(job_id: str):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"job_id": job_id, **job}
+    return job
 
 
 @app.get("/jobs/{job_id}/download")
@@ -399,15 +587,18 @@ def download_job(job_id: str, background_tasks: BackgroundTasks):
     if job["status"] == "processing":
         raise HTTPException(status_code=409, detail="Job is still processing")
     if job["status"] == "failed":
-        raise HTTPException(status_code=500, detail=job.get("error", "Job failed"))
+        raise HTTPException(status_code=500, detail=job.get("error") or "Job failed")
 
     file_path = job.get("file")
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Output file not found")
 
+    # Atomic claim so concurrent downloads can't both remove the file.
+    if not JOBS.claim_for_download(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+
     media_type = "application/zip" if file_path.endswith(".zip") else "video/mp4"
     background_tasks.add_task(cleanup_files, file_path)
-    JOBS.pop(job_id, None)
     return FileResponse(
         file_path, media_type=media_type, filename=os.path.basename(file_path)
     )
