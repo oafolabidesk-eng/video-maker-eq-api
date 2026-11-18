@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 JOBS_DB = os.environ.get("JOBS_DB", "jobs.db")
-JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_HOURS", "24")) * 3600
+# How long finished/failed jobs and their files are kept. 0 = keep forever.
+JOB_TTL_SECONDS = max(0, int(os.environ.get("JOB_TTL_HOURS", "168"))) * 3600
 HEARTBEAT_INTERVAL = 10      # seconds between heartbeats from a live process
 STALE_AFTER = 45             # "processing" job with no heartbeat this long = dead
 MAINTENANCE_INTERVAL = 600   # seconds between expiry / orphan sweeps
@@ -93,14 +94,19 @@ class JobStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def claim_for_download(self, job_id: str) -> bool:
-        """Atomically delete a finished job; only one caller can win."""
+    def delete(self, job_id: str) -> None:
         with closing(self._conn()) as conn, conn:
-            cur = conn.execute(
-                "DELETE FROM jobs WHERE job_id = ? AND status = 'completed'",
-                (job_id,),
-            )
-            return cur.rowcount == 1
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+
+    def list_jobs(self, limit: int = 100) -> List[dict]:
+        self.fail_stale()
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT job_id, type, status, file, error, created_at, updated_at "
+                "FROM jobs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def heartbeat(self) -> None:
         with closing(self._conn()) as conn, conn:
@@ -123,6 +129,8 @@ class JobStore:
 
     def purge_expired(self) -> List[str]:
         """Delete finished/failed jobs older than the TTL; return their output files."""
+        if JOB_TTL_SECONDS <= 0:
+            return []
         cutoff = time.time() - JOB_TTL_SECONDS
         with closing(self._conn()) as conn, conn:
             rows = conn.execute(
@@ -148,6 +156,8 @@ def sweep_orphan_files() -> None:
         is_temp = bool(_TEMP_FILE_RE.match(name))
         if not (is_output or is_temp):
             continue
+        if is_output and JOB_TTL_SECONDS <= 0:
+            continue  # retention disabled: never auto-delete finished videos
         max_age = JOB_TTL_SECONDS if is_output else 3600
         try:
             if os.path.isfile(name) and now - os.path.getmtime(name) > max_age:
@@ -579,8 +589,14 @@ def job_status(job_id: str):
     return job
 
 
+@app.get("/jobs")
+def list_jobs():
+    return {"jobs": JOBS.list_jobs()}
+
+
 @app.get("/jobs/{job_id}/download")
-def download_job(job_id: str, background_tasks: BackgroundTasks):
+def download_job(job_id: str):
+    """Stream the finished file. Nothing is deleted; download as often as needed."""
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -593,12 +609,20 @@ def download_job(job_id: str, background_tasks: BackgroundTasks):
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Output file not found")
 
-    # Atomic claim so concurrent downloads can't both remove the file.
-    if not JOBS.claim_for_download(job_id):
-        raise HTTPException(status_code=404, detail="Job not found")
-
     media_type = "application/zip" if file_path.endswith(".zip") else "video/mp4"
-    background_tasks.add_task(cleanup_files, file_path)
     return FileResponse(
         file_path, media_type=media_type, filename=os.path.basename(file_path)
     )
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str):
+    """Explicitly remove a job and its file (call this after saving to Drive)."""
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] == "processing":
+        raise HTTPException(status_code=409, detail="Job is still processing")
+    cleanup_files(job.get("file"))
+    JOBS.delete(job_id)
+    return {"job_id": job_id, "deleted": True}
