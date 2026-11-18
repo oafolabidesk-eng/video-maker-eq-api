@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango1.0-dev \
     pkg-config \
     gcc \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
